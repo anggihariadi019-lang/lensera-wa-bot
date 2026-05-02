@@ -1,9 +1,6 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
-const pino = require('pino');
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
 const fetch = require('node-fetch');
-const fs = require('fs');
-const path = require('path');
 
 // ─── KONFIGURASI ─────────────────────────────────────────────────────────────
 const SB_URL = process.env.SUPABASE_URL;
@@ -23,10 +20,7 @@ async function insertBooking(data) {
     headers: { ...SB_HEADERS, 'Prefer': 'return=representation' },
     body: JSON.stringify(data),
   });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error('Supabase error: ' + err);
-  }
+  if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
@@ -58,14 +52,12 @@ function parseFormBooking(text) {
 
   if (!nama || !noWa) return null;
 
-  const shootDate = parseIndonesianDate(tglFoto);
-
   return {
     name:         nama,
     phone:        noWa.replace(/[^0-9+]/g, ''),
     session_type: jenisAcara || 'Lainnya',
     package:      paket || '-',
-    shoot_date:   shootDate || null,
+    shoot_date:   parseIndonesianDate(tglFoto),
     notes:        [
       lokasi    ? `Lokasi: ${lokasi}`       : null,
       instagram ? `Instagram: ${instagram}` : null,
@@ -96,137 +88,91 @@ function isBookingForm(text) {
 }
 
 // ─── BOT UTAMA ───────────────────────────────────────────────────────────────
-let retryCount = 0;
+const client = new Client({
+  authStrategy: new LocalAuth({ dataPath: './auth_data' }),
+  puppeteer: {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process',
+      '--disable-gpu'
+    ],
+  }
+});
 
-async function startBot() {
-  console.log('🚀 Memulai LensEra WA Bot...');
+client.on('qr', (qr) => {
+  console.log('\n📱 QR CODE — Scan pakai WhatsApp kamu:\n');
+  qrcode.generate(qr, { small: true });
+  console.log('\n(Buka WA → titik tiga → Linked Devices → Link a Device)\n');
+});
 
-  const authDir = path.join(process.cwd(), 'auth_info');
-  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
+client.on('authenticated', () => {
+  console.log('🔐 Autentikasi berhasil!');
+});
 
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+client.on('auth_failure', (msg) => {
+  console.error('❌ Autentikasi gagal:', msg);
+});
 
-  let version;
-  try {
-    const latest = await fetchLatestBaileysVersion();
-    version = latest.version;
-    console.log('📦 Baileys version:', version.join('.'));
-  } catch(e) {
-    version = [2, 3000, 1015901307];
-    console.log('📦 Menggunakan versi fallback Baileys');
+client.on('ready', () => {
+  console.log('✅ LensEra Bot siap! Menunggu form booking...');
+});
+
+client.on('disconnected', (reason) => {
+  console.log('⚠️  Bot disconnect:', reason);
+  console.log('🔄 Restart dalam 5 detik...');
+  setTimeout(() => client.initialize(), 5000);
+});
+
+client.on('message', async (msg) => {
+  const text = msg.body || '';
+  if (!isBookingForm(text)) return;
+
+  // Cek admin
+  const senderNum = msg.from.replace('@c.us', '').replace('@g.us', '');
+  if (ALLOWED_ADMINS.length > 0 && !ALLOWED_ADMINS.includes(senderNum)) return;
+
+  console.log(`📩 Form booking diterima dari ${senderNum}`);
+
+  const booking = parseFormBooking(text);
+
+  if (!booking) {
+    await msg.reply(
+      '❌ *Gagal parse form booking.*\n\n' +
+      'Pastikan format lengkap:\n' +
+      '- Nama :\n- No. WA :\n- Paket Foto :\n- Tanggal Foto :\n- Jenis acara :'
+    );
+    return;
   }
 
-  const logger = pino({ level: 'silent' });
+  try {
+    await insertBooking(booking);
+    await addLog(`[BOT] Booking baru via WA: ${booking.name} (${booking.phone})`);
 
-  const sock = makeWASocket({
-    version,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
-    logger,
-    printQRInTerminal: true,
-    browser: ['LensEra Bot', 'Chrome', '1.0.0'],
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 10000,
-    retryRequestDelayMs: 2000,
-    maxMsgRetryCount: 3,
-  });
+    const tglRaw = text.match(/Tanggal\s*Foto\s*:\s*(.+)/i)?.[1]?.trim() || '-';
 
-  sock.ev.on('creds.update', saveCreds);
+    await msg.reply(
+      `✅ *Booking berhasil disimpan ke LensEra!*\n\n` +
+      `👤 *Client:* ${booking.name}\n` +
+      `📱 *WA:* ${booking.phone}\n` +
+      `📦 *Paket:* ${booking.package}\n` +
+      `📅 *Tanggal Foto:* ${tglRaw}\n` +
+      `🎭 *Jenis:* ${booking.session_type}\n\n` +
+      `_Data sudah masuk ke workflow LensEra Studio_ 🎉`
+    );
 
-  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
-      console.log('📱 QR CODE MUNCUL — Scan dengan WhatsApp kamu sekarang!');
-    }
+    console.log(`✅ Booking "${booking.name}" berhasil disimpan`);
 
-    if (connection === 'close') {
-      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-
-      console.log(`⚠️  Koneksi terputus. Kode: ${statusCode}`);
-
-      if (isLoggedOut) {
-        console.log('🔴 Logged out! Menghapus sesi lama...');
-        try { fs.rmSync(authDir, { recursive: true, force: true }); } catch(e) {}
-        setTimeout(startBot, 3000);
-      } else {
-        retryCount++;
-        const delay = Math.min(retryCount * 3000, 30000);
-        console.log(`🔄 Reconnect ke-${retryCount} dalam ${delay/1000} detik...`);
-        setTimeout(startBot, delay);
-      }
-    }
-
-    if (connection === 'open') {
-      retryCount = 0;
-      console.log('✅ LensEra Bot terhubung ke WhatsApp!');
-      console.log('👂 Menunggu form booking...');
-    }
-  });
-
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-
-    for (const msg of messages) {
-      if (msg.key.fromMe) continue;
-
-      const from      = msg.key.remoteJid;
-      const sender    = msg.key.participant || from;
-      const senderNum = sender.replace('@s.whatsapp.net', '').replace('@g.us', '');
-
-      if (ALLOWED_ADMINS.length > 0 && !ALLOWED_ADMINS.includes(senderNum)) continue;
-
-      const text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        '';
-
-      if (!text || !isBookingForm(text)) continue;
-
-      console.log(`📩 Form booking diterima dari ${senderNum}`);
-
-      const booking = parseFormBooking(text);
-
-      if (!booking) {
-        await sock.sendMessage(from, {
-          text: '❌ *Gagal parse form booking.*\n\nPastikan format lengkap:\n- Nama :\n- No. WA :\n- Paket Foto :\n- Tanggal Foto :\n- Jenis acara :'
-        }, { quoted: msg });
-        continue;
-      }
-
-      try {
-        await insertBooking(booking);
-        await addLog(`[BOT] Booking baru via WA: ${booking.name} (${booking.phone})`);
-
-        const tglRaw = text.match(/Tanggal\s*Foto\s*:\s*(.+)/i)?.[1]?.trim() || '-';
-
-        await sock.sendMessage(from, {
-          text:
-            `✅ *Booking berhasil disimpan ke LensEra!*\n\n` +
-            `👤 *Client:* ${booking.name}\n` +
-            `📱 *WA:* ${booking.phone}\n` +
-            `📦 *Paket:* ${booking.package}\n` +
-            `📅 *Tanggal Foto:* ${tglRaw}\n` +
-            `🎭 *Jenis:* ${booking.session_type}\n\n` +
-            `_Data sudah masuk ke workflow LensEra Studio_ 🎉`
-        }, { quoted: msg });
-
-        console.log(`✅ Booking "${booking.name}" berhasil disimpan`);
-
-      } catch (err) {
-        console.error('❌ Error Supabase:', err.message);
-        await sock.sendMessage(from, {
-          text: `❌ *Gagal simpan ke database.*\n\nError: ${err.message}`
-        }, { quoted: msg });
-      }
-    }
-  });
-}
-
-startBot().catch(err => {
-  console.error('❌ Fatal error:', err);
-  setTimeout(startBot, 5000);
+  } catch (err) {
+    console.error('❌ Error:', err.message);
+    await msg.reply(`❌ *Gagal simpan ke database.*\n\nError: ${err.message}`);
+  }
 });
+
+console.log('🚀 Memulai LensEra WA Bot...');
+client.initialize();
